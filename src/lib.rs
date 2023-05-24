@@ -81,15 +81,15 @@ fn nix_to_io_error(nix_error: nix::Error) -> std::io::Error {
     std::io::Error::from_raw_os_error(nix_error as i32)
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct IOStat {
-    device: String,
-    rbytes: u64,
-    wbytes: u64,
-    rios: u64,
-    wios: u64,
-    dbytes: u64,
-    dios: u64,
+    pub device: String,
+    pub rbytes: u64,
+    pub wbytes: u64,
+    pub rios: u64,
+    pub wios: u64,
+    pub dbytes: u64,
+    pub dios: u64,
 }
 
 #[derive(Debug)]
