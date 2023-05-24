@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use nix::unistd::{chown, Pid, Uid};
+use std::{num::ParseIntError, path::PathBuf, str::FromStr};
 use thiserror::Error;
 
 #[macro_use]
@@ -12,6 +13,83 @@ pub enum CgroupError {
     CreateNodeError(std::io::Error),
     #[error("error when reading cgroup file: {0}")]
     ReadFileError(std::io::Error),
+    #[error("error when removing cgroup node: {0}")]
+    RemoveNodeError(std::io::Error),
+    #[error("error when writing to cgroup file: {0}")]
+    WriteFileError(std::io::Error),
+    #[error("error when delegating (chowning): {0}")]
+    DelegateError(std::io::Error),
+    #[error("invalid operation: {0}")]
+    InvalidOperation(String),
+}
+
+#[derive(PartialEq)]
+pub enum SubtreeControl {
+    Cpuset,
+    Cpu,
+    Io,
+    Memory,
+    Hugetlb,
+    Pids,
+    Rdma,
+    Misc,
+    Others(String),
+}
+
+impl std::fmt::Display for SubtreeControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubtreeControl::Cpuset => write!(f, "cpuset"),
+            SubtreeControl::Cpu => write!(f, "cpu"),
+            SubtreeControl::Io => write!(f, "io"),
+            SubtreeControl::Memory => write!(f, "memory"),
+            SubtreeControl::Hugetlb => write!(f, "hugetlb"),
+            SubtreeControl::Pids => write!(f, "pids"),
+            SubtreeControl::Rdma => write!(f, "rdma"),
+            SubtreeControl::Misc => write!(f, "misc"),
+            SubtreeControl::Others(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+impl FromStr for SubtreeControl {
+    type Err = CgroupError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "cpuset" => Ok(SubtreeControl::Cpuset),
+            "cpu" => Ok(SubtreeControl::Cpu),
+            "io" => Ok(SubtreeControl::Io),
+            "memory" => Ok(SubtreeControl::Memory),
+            "hugetlb" => Ok(SubtreeControl::Hugetlb),
+            "pids" => Ok(SubtreeControl::Pids),
+            "rdma" => Ok(SubtreeControl::Rdma),
+            "misc" => Ok(SubtreeControl::Misc),
+            _ => Ok(SubtreeControl::Others(s.into())),
+        }
+    }
+}
+
+pub enum DelegateMode {
+    DelegateNewSubtree,
+    DelegateProcs,
+    DelegateSubtreeControl,
+    DelegateThreads,
+}
+
+fn nix_to_io_error(nix_error: nix::Error) -> std::io::Error {
+    std::io::Error::from_raw_os_error(nix_error as i32)
+}
+
+#[derive(Debug, Default)]
+pub struct IOStat {
+    device: String,
+    rbytes: u64,
+    wbytes: u64,
+    rios: u64,
+    wios: u64,
+    dbytes: u64,
+    dios: u64,
 }
 
 #[derive(Debug)]
@@ -49,12 +127,9 @@ impl CgroupController {
     pub fn get_from_current(&self) -> Result<CgroupNode, CgroupError> {
         // Get cgroup path from /proc/self/cgroup
         let cgroup_file_contents =
-            std::fs::read("/proc/self/cgroup").map_err(CgroupError::ReadFileError)?;
+            std::fs::read_to_string("/proc/self/cgroup").map_err(CgroupError::ReadFileError)?;
 
-        let hierarchy_list = String::from_utf8(cgroup_file_contents)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-            .map_err(CgroupError::ReadFileError)?;
-        let hierarchy_list: Vec<_> = hierarchy_list.trim().splitn(3, ':').collect();
+        let hierarchy_list: Vec<_> = cgroup_file_contents.trim().splitn(3, ':').collect();
 
         if hierarchy_list.len() != 3 {
             return Err(CgroupError::ReadFileError(std::io::Error::new(
@@ -71,6 +146,25 @@ impl CgroupController {
         debug!("cgroup path: {:?}", path);
 
         CgroupNode::create(&path, true)
+    }
+
+    pub fn create_from_node_path(
+        &self,
+        node: &CgroupNode,
+        name: &PathBuf,
+        allow_exists: bool,
+    ) -> Result<CgroupNode, CgroupError> {
+        if !node.path.starts_with(&self.root) {
+            return Err(CgroupError::CreateNodeError(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "node path is not under cgroup root",
+            )));
+        }
+        self.create_from_path(name, allow_exists)
+    }
+
+    pub fn get_root_node(&self) -> Result<CgroupNode, CgroupError> {
+        CgroupNode::create(&self.root, true)
     }
 }
 
@@ -97,20 +191,161 @@ impl CgroupNode {
         Ok(CgroupNode { path: path.clone() })
     }
 
-    pub fn get_pid_list(&self) -> Result<Vec<u64>, CgroupError> {
+    pub fn children(&self) -> Result<Vec<CgroupNode>, CgroupError> {
+        let mut res = Vec::new();
+        for entry in self.path.read_dir().map_err(CgroupError::ReadFileError)? {
+            let entry = entry.map_err(CgroupError::ReadFileError)?;
+            if entry
+                .metadata()
+                .map_err(CgroupError::ReadFileError)?
+                .is_dir()
+            {
+                res.push(CgroupNode::create(&entry.path(), true)?);
+            }
+        }
+        Ok(res)
+    }
+
+    pub fn move_process(&mut self, pid: Pid) -> Result<(), CgroupError> {
+        let pid_str = pid.to_string();
+        std::fs::write(self.path.join("cgroup.procs"), pid_str).map_err(CgroupError::WriteFileError)
+    }
+
+    pub fn cleanup(&self, dst_node: &mut CgroupNode) -> Result<(), CgroupError> {
+        if dst_node.path.starts_with(&self.path) {
+            return Err(CgroupError::InvalidOperation(
+                "cleanup dst node is under src node".into(),
+            ));
+        }
+        for child in self.children()? {
+            child.cleanup(dst_node)?;
+        }
+        let pid_list = self.get_pid_list()?;
+        for pid in pid_list {
+            dst_node.move_process(pid)?;
+        }
+        Ok(())
+    }
+
+    pub fn destroy(self) -> Result<(), CgroupError> {
+        for child in self.children()? {
+            child.destroy()?;
+        }
+        std::fs::remove_dir(self.path).map_err(CgroupError::RemoveNodeError)
+    }
+
+    pub fn get_pid_list(&self) -> Result<Vec<Pid>, CgroupError> {
         // read cgroup.procs file
-        let pid_list_contents =
-            std::fs::read(self.path.join("cgroup.procs")).map_err(CgroupError::ReadFileError)?;
-        let pid_list: Result<Vec<u64>, _> = String::from_utf8(pid_list_contents)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-            .map_err(CgroupError::ReadFileError)?
+        let pid_list_contents = std::fs::read_to_string(self.path.join("cgroup.procs"))
+            .map_err(CgroupError::ReadFileError)?;
+        let pid_list: Result<Vec<Pid>, _> = pid_list_contents
             .trim_end()
             .split('\n')
-            .map(|pid| pid.trim().parse())
+            .map(|pid| -> Result<Pid, ParseIntError> { Ok(Pid::from_raw(pid.trim().parse()?)) })
             .collect();
         pid_list.map_err(|e| {
             CgroupError::ReadFileError(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         })
+    }
+
+    pub fn get_subtree_controls(&self) -> Result<Vec<SubtreeControl>, CgroupError> {
+        let subtree_control_contents =
+            std::fs::read_to_string(self.path.join("cgroup.subtree_control"))
+                .map_err(CgroupError::ReadFileError)?;
+        subtree_control_contents
+            .trim_end()
+            .split(' ')
+            .map(|control| control.parse())
+            .collect()
+    }
+
+    pub fn adjust_subtree_controls(
+        &mut self,
+        add_list: &[SubtreeControl],
+        remove_list: &[SubtreeControl],
+    ) -> Result<(), CgroupError> {
+        let mut control_str = String::new();
+        for control in add_list {
+            control_str.push('+');
+            control_str.push_str(&control.to_string());
+            control_str.push(' ');
+        }
+        for control in remove_list {
+            control_str.push('-');
+            control_str.push_str(&control.to_string());
+            control_str.push(' ');
+        }
+        std::fs::write(self.path.join("cgroup.subtree_control"), control_str)
+            .map_err(CgroupError::WriteFileError)
+    }
+
+    pub fn delegate(&mut self, uid: Uid, modes: &[DelegateMode]) -> Result<(), CgroupError> {
+        for mode in modes {
+            let file = match mode {
+                DelegateMode::DelegateNewSubtree => ".",
+                DelegateMode::DelegateProcs => "cgroup.procs",
+                DelegateMode::DelegateSubtreeControl => "cgroup.subtree_control",
+                DelegateMode::DelegateThreads => "cgroup.threads",
+            };
+            let path = self.path.join(file);
+
+            chown(&path, Some(uid), None)
+                .map_err(nix_to_io_error)
+                .map_err(CgroupError::DelegateError)?;
+        }
+        Ok(())
+    }
+
+    pub fn get_memory_peak(&self) -> Result<u64, CgroupError> {
+        let contents = std::fs::read_to_string(self.path.join("memory.peak"))
+            .map_err(CgroupError::ReadFileError)?;
+        contents.trim_end().parse().map_err(|e| {
+            CgroupError::ReadFileError(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })
+    }
+
+    pub fn get_io_stat(&self) -> Result<Vec<IOStat>, CgroupError> {
+        macro_rules! invalid_format_error {
+            () => {
+                CgroupError::ReadFileError(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid io.stat format",
+                ))
+            };
+            ($e: expr) => {
+                CgroupError::ReadFileError(std::io::Error::new(std::io::ErrorKind::InvalidData, $e))
+            };
+        }
+        let contents = std::fs::read_to_string(self.path.join("io.stat"))
+            .map_err(CgroupError::ReadFileError)?;
+        let mut stats = Vec::new();
+        for line in contents.trim_end().split('\n') {
+            let mut fields = line.split_whitespace();
+            let mut stat = IOStat::default();
+            let device = fields.next().ok_or_else(|| invalid_format_error!())?;
+            stat.device = device.to_string();
+            for field in fields {
+                let parts = field
+                    .split_once('=')
+                    .ok_or_else(|| invalid_format_error!())?;
+                macro_rules! parse_field {
+                    () => {
+                        parts.1.parse().map_err(|e| invalid_format_error!(e))?
+                    };
+                }
+                match parts.0 {
+                    "rbytes" => stat.rbytes = parse_field!(),
+                    "wbytes" => stat.wbytes = parse_field!(),
+                    "rios" => stat.rios = parse_field!(),
+                    "wios" => stat.wios = parse_field!(),
+                    "dbytes" => stat.dbytes = parse_field!(),
+                    "dios" => stat.dios = parse_field!(),
+                    _ => return Err(invalid_format_error!()),
+                }
+            }
+            stats.push(stat);
+        }
+        Ok(stats)
     }
 }
 
@@ -120,10 +355,47 @@ mod tests {
     use test_log::test;
 
     #[test]
-    fn show_current_node_pid() {
+    fn get_current_node_pid() {
         let ctl = CgroupController::default();
         let node = ctl.get_from_current().unwrap();
         let pid_list = node.get_pid_list().unwrap();
-        assert!(pid_list.contains(&std::process::id().into()));
+        assert!(pid_list.contains(&Pid::this()));
+    }
+
+    #[test]
+    fn get_root_children() {
+        let ctl = CgroupController::default();
+        let root = ctl.get_root_node().unwrap();
+        let children = root.children().unwrap();
+        for child in children {
+            if child.path.ends_with("system.slice") {
+                return;
+            }
+        }
+        assert!(false)
+    }
+
+    #[test]
+    fn get_root_subtree_control() {
+        let ctl = CgroupController::default();
+        let root = ctl.get_root_node().unwrap();
+        let controls = root.get_subtree_controls().unwrap();
+        assert!(controls.contains(&SubtreeControl::Pids));
+    }
+
+    #[test]
+    fn get_memory_peak() {
+        let ctl = CgroupController::default();
+        let node = ctl.get_from_current().unwrap();
+        let peak = node.get_memory_peak().unwrap();
+        assert!(peak > 0);
+    }
+
+    #[test]
+    fn get_io_stat() {
+        let ctl = CgroupController::default();
+        let node = ctl.get_root_node().unwrap();
+        let stats = node.get_io_stat().unwrap();
+        assert!(stats.len() > 0);
     }
 }
