@@ -5,6 +5,8 @@ use thiserror::Error;
 #[macro_use]
 extern crate log;
 
+pub mod utils;
+
 const DEFAULT_CGROUPV2_PATH: &str = "/sys/fs/cgroup/";
 
 #[derive(Error, Debug)]
@@ -160,7 +162,7 @@ impl CgroupController {
                 "node path is not under cgroup root",
             )));
         }
-        self.create_from_path(name, allow_exists)
+        self.create_from_path(&node.path.join(name), allow_exists)
     }
 
     pub fn get_root_node(&self) -> Result<CgroupNode, CgroupError> {
@@ -520,5 +522,30 @@ mod tests {
 
         // kill the testing process
         handle.kill().unwrap();
+    }
+
+    #[test]
+    fn utils_u32_to_bytes_test() {
+        use utils::u32_to_bytes;
+        let mut buf = [0u8; 10];
+        assert_eq!(u32_to_bytes(0, &mut buf), 1);
+        assert_eq!(buf[0], b'0');
+        assert_eq!(u32_to_bytes(1, &mut buf), 1);
+        assert_eq!(buf[0], b'1');
+        assert_eq!(u32_to_bytes(123, &mut buf), 3);
+        assert_eq!(buf[0], b'1');
+        assert_eq!(buf[1], b'2');
+        assert_eq!(buf[2], b'3');
+        assert_eq!(u32_to_bytes(1234567890, &mut buf), 10);
+        assert_eq!(buf[0], b'1');
+        assert_eq!(buf[1], b'2');
+        assert_eq!(buf[2], b'3');
+        assert_eq!(buf[3], b'4');
+        assert_eq!(buf[4], b'5');
+        assert_eq!(buf[5], b'6');
+        assert_eq!(buf[6], b'7');
+        assert_eq!(buf[7], b'8');
+        assert_eq!(buf[8], b'9');
+        assert_eq!(buf[9], b'0');
     }
 }

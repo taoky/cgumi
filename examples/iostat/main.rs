@@ -1,4 +1,4 @@
-// Get the io stat of the root cgroup 
+// Get the io stat of the root cgroup
 // Print read, write, discard Byte/s and IOPs every second.
 
 use std::{collections::HashMap, time::Duration};
