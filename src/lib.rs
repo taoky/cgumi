@@ -23,7 +23,7 @@ pub enum CgroupError {
     InvalidOperation(String),
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 pub enum SubtreeControl {
     Cpuset,
     Cpu,
@@ -256,6 +256,7 @@ impl CgroupNode {
         subtree_control_contents
             .trim_end()
             .split(' ')
+            .filter(|control| !control.is_empty())
             .map(|control| control.parse())
             .collect()
     }
@@ -352,9 +353,11 @@ impl CgroupNode {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use super::*;
-    use test_log::test;
     use rand;
+    use test_log::test;
 
     fn is_root() -> bool {
         Uid::current().is_root()
@@ -419,7 +422,9 @@ mod tests {
         // randomly generate a test node
         let test_node_name = format!("test_node_{}", rand::random::<u64>());
         let root = ctl.get_root_node().unwrap();
-        let test_node = ctl.create_from_node_path(&root, &PathBuf::from(test_node_name), true).unwrap();
+        let test_node = ctl
+            .create_from_node_path(&root, &PathBuf::from(test_node_name), true)
+            .unwrap();
         test_node
     }
 
@@ -445,12 +450,75 @@ mod tests {
         let ctl = CgroupController::default();
         let mut test_node = create_test_node_on_root_node(&ctl);
 
-        test_node.delegate(Uid::from_raw(1000), &[
-            DelegateMode::DelegateNewSubtree,
-            DelegateMode::DelegateProcs,
-            DelegateMode::DelegateSubtreeControl
-        ]).unwrap();
+        test_node
+            .delegate(
+                Uid::from_raw(1000),
+                &[
+                    DelegateMode::DelegateNewSubtree,
+                    DelegateMode::DelegateProcs,
+                    DelegateMode::DelegateSubtreeControl,
+                ],
+            )
+            .unwrap();
         // cleanup
         cleanup_node(&ctl, test_node);
+    }
+
+    #[test]
+    fn subtree_test() {
+        root_only!();
+        let ctl = CgroupController::default();
+        let mut test_node = create_test_node_on_root_node(&ctl);
+
+        let subtree = test_node.get_subtree_controls().unwrap();
+        debug!("{:?}", subtree);
+        assert!(subtree.len() == 0);
+        test_node
+            .adjust_subtree_controls(
+                &[
+                    SubtreeControl::Cpu,
+                    SubtreeControl::Memory,
+                    SubtreeControl::Io,
+                ],
+                &[],
+            )
+            .unwrap();
+        let subtree = test_node.get_subtree_controls().unwrap();
+        assert!(subtree.len() == 3);
+        test_node
+            .adjust_subtree_controls(
+                &[],
+                &[
+                    SubtreeControl::Cpu,
+                    SubtreeControl::Memory,
+                    SubtreeControl::Io,
+                ],
+            )
+            .unwrap();
+        let subtree = test_node.get_subtree_controls().unwrap();
+        assert!(subtree.len() == 0);
+
+        cleanup_node(&ctl, test_node);
+    }
+
+    #[test]
+    fn move_pid_test() {
+        root_only!();
+        // create a testing process that sleeps 10s
+        let mut handle = Command::new("sleep").arg("10").spawn().unwrap();
+        let pid = Pid::from_raw(handle.id() as i32);
+
+        let ctl = CgroupController::default();
+        let mut test_node = create_test_node_on_root_node(&ctl);
+
+        test_node.move_process(pid).unwrap();
+        let pid_list = test_node.get_pid_list().unwrap();
+        assert!(pid_list.contains(&pid));
+
+        // test if cleanup succeeds
+        cleanup_node(&ctl, test_node);
+
+        // kill the testing process
+        handle.kill().unwrap();
     }
 }
