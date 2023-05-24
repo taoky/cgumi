@@ -241,6 +241,7 @@ impl CgroupNode {
         let pid_list: Result<Vec<Pid>, _> = pid_list_contents
             .trim_end()
             .split('\n')
+            .filter(|pid| !pid.is_empty())
             .map(|pid| -> Result<Pid, ParseIntError> { Ok(Pid::from_raw(pid.trim().parse()?)) })
             .collect();
         pid_list.map_err(|e| {
@@ -353,6 +354,21 @@ impl CgroupNode {
 mod tests {
     use super::*;
     use test_log::test;
+    use rand;
+
+    fn is_root() -> bool {
+        Uid::current().is_root()
+    }
+
+    // it could be better if Rust supports runtime conditional test
+    macro_rules! root_only {
+        () => {
+            if !is_root() {
+                warn!("Not running as root, skipping");
+                return;
+            }
+        };
+    }
 
     #[test]
     fn get_current_node_pid() {
@@ -397,5 +413,44 @@ mod tests {
         let node = ctl.get_root_node().unwrap();
         let stats = node.get_io_stat().unwrap();
         assert!(stats.len() > 0);
+    }
+
+    fn create_test_node_on_root_node(ctl: &CgroupController) -> CgroupNode {
+        // randomly generate a test node
+        let test_node_name = format!("test_node_{}", rand::random::<u64>());
+        let root = ctl.get_root_node().unwrap();
+        let test_node = ctl.create_from_node_path(&root, &PathBuf::from(test_node_name), true).unwrap();
+        test_node
+    }
+
+    fn cleanup_node(ctl: &CgroupController, node: CgroupNode) {
+        let mut root = ctl.get_root_node().unwrap();
+        node.cleanup(&mut root).unwrap();
+        node.destroy().unwrap();
+    }
+
+    #[test]
+    fn create_new_node() {
+        root_only!();
+        let ctl = CgroupController::default();
+        let test_node = create_test_node_on_root_node(&ctl);
+
+        // cleanup
+        cleanup_node(&ctl, test_node);
+    }
+
+    #[test]
+    fn delegation_test() {
+        root_only!();
+        let ctl = CgroupController::default();
+        let mut test_node = create_test_node_on_root_node(&ctl);
+
+        test_node.delegate(Uid::from_raw(1000), &[
+            DelegateMode::DelegateNewSubtree,
+            DelegateMode::DelegateProcs,
+            DelegateMode::DelegateSubtreeControl
+        ]).unwrap();
+        // cleanup
+        cleanup_node(&ctl, test_node);
     }
 }

@@ -6,9 +6,9 @@ There is no plan for legacy cgroupv1 support.
 
 ## Planned features
 
-- [ ] Create node
-- [ ] Move process to node
-- [ ] Delegate node (chown)
-- [ ] Get memory usage
+- [x] Create node
+- [x] Move process to node
+- [x] Delegate node (chown)
+- [x] Get memory & io usage
 - [ ] Sudo + sh support
 - [ ] Systemd support
