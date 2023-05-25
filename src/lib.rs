@@ -8,7 +8,7 @@ extern crate log;
 
 pub mod utils;
 
-const DEFAULT_CGROUPV2_PATH: &str = "/sys/fs/cgroup/";
+pub const CGROUPV2_DEFAULT_PATH: &str = "/sys/fs/cgroup/";
 
 #[derive(Error, Debug)]
 pub enum CgroupError {
@@ -103,6 +103,7 @@ pub enum PrivilegeOpType {
     DelegateNode,
     RemoveNode,
     MoveProcess,
+    AdjustSubtreeControls,
 }
 
 type RequestClosure = Box<dyn Fn(&PrivilegeOpType, &str) -> Result<(), std::io::Error>>;
@@ -124,7 +125,7 @@ impl std::fmt::Debug for CgroupController {
 impl Default for CgroupController {
     fn default() -> Self {
         Self {
-            root: DEFAULT_CGROUPV2_PATH.into(),
+            root: CGROUPV2_DEFAULT_PATH.into(),
             request_func: None,
         }
     }
@@ -277,7 +278,30 @@ impl CgroupNode<'_> {
 
     pub fn move_process(&mut self, pid: Pid) -> Result<(), CgroupError> {
         let pid_str = pid.to_string();
-        std::fs::write(self.path.join("cgroup.procs"), pid_str).map_err(CgroupError::WriteFileError)
+        let procs_path = self.path.join("cgroup.procs");
+        let res = std::fs::write(&procs_path, &pid_str);
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::PermissionDenied => {
+                    if let Some(request_func) = self.request_func {
+                        Ok(request_func(
+                            &PrivilegeOpType::MoveProcess,
+                            format!(
+                                "echo {} > {}",
+                                escape(pid_str.into()),
+                                escape(procs_path.to_string_lossy())
+                            )
+                            .as_str(),
+                        )
+                        .map_err(CgroupError::RequestUserError)?)
+                    } else {
+                        Err(CgroupError::WriteFileError(e))
+                    }
+                }
+                _ => Err(CgroupError::WriteFileError(e)),
+            },
+        }
     }
 
     pub fn cleanup(&self, dst_node: &mut CgroupNode) -> Result<(), CgroupError> {
@@ -300,7 +324,24 @@ impl CgroupNode<'_> {
         for child in self.children()? {
             child.destroy()?;
         }
-        std::fs::remove_dir(self.path).map_err(CgroupError::RemoveNodeError)
+        let res = std::fs::remove_dir(&self.path);
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::PermissionDenied => {
+                    if let Some(request_func) = self.request_func {
+                        Ok(request_func(
+                            &PrivilegeOpType::RemoveNode,
+                            format!("rmdir {}", escape(self.path.to_string_lossy())).as_str(),
+                        )
+                        .map_err(CgroupError::RequestUserError)?)
+                    } else {
+                        Err(CgroupError::RemoveNodeError(e))
+                    }
+                }
+                _ => Err(CgroupError::RemoveNodeError(e)),
+            },
+        }
     }
 
     pub fn get_pid_list(&self) -> Result<Vec<Pid>, CgroupError> {
@@ -336,6 +377,7 @@ impl CgroupNode<'_> {
         remove_list: &[SubtreeControl],
     ) -> Result<(), CgroupError> {
         let mut control_str = String::new();
+        let subtree_path = self.path.join("cgroup.subtree_control");
         for control in add_list {
             control_str.push('+');
             control_str.push_str(&control.to_string());
@@ -346,8 +388,29 @@ impl CgroupNode<'_> {
             control_str.push_str(&control.to_string());
             control_str.push(' ');
         }
-        std::fs::write(self.path.join("cgroup.subtree_control"), control_str)
-            .map_err(CgroupError::WriteFileError)
+        let res = std::fs::write(&subtree_path, &control_str);
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::PermissionDenied => {
+                    if let Some(request_func) = self.request_func {
+                        Ok(request_func(
+                            &PrivilegeOpType::AdjustSubtreeControls,
+                            format!(
+                                "echo {} > {}",
+                                escape(control_str.into()),
+                                escape(subtree_path.to_string_lossy())
+                            )
+                            .as_str(),
+                        )
+                        .map_err(CgroupError::RequestUserError)?)
+                    } else {
+                        Err(CgroupError::WriteFileError(e))
+                    }
+                }
+                _ => Err(CgroupError::WriteFileError(e)),
+            },
+        }
     }
 
     pub fn delegate(&mut self, uid: Uid, modes: &[DelegateMode]) -> Result<(), CgroupError> {
@@ -360,9 +423,28 @@ impl CgroupNode<'_> {
             };
             let path = self.path.join(file);
 
-            chown(&path, Some(uid), None)
-                .map_err(nix_to_io_error)
-                .map_err(CgroupError::DelegateError)?;
+            let res = chown(&path, Some(uid), None);
+            match res {
+                Ok(_) => {}
+                Err(e) => {
+                    let e = nix_to_io_error(e);
+                    match e.kind() {
+                        std::io::ErrorKind::PermissionDenied => {
+                            if let Some(request_func) = self.request_func {
+                                request_func(
+                                    &PrivilegeOpType::DelegateNode,
+                                    format!("chown {} {}", uid, escape(path.to_string_lossy()))
+                                        .as_str(),
+                                )
+                                .map_err(CgroupError::RequestUserError)?
+                            } else {
+                                return Err(CgroupError::DelegateError(e));
+                            }
+                        }
+                        _ => return Err(CgroupError::DelegateError(e)),
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -637,7 +719,7 @@ mod tests {
 
         let node_name_clone = node_name.clone();
         let ctl = CgroupController::new(
-            DEFAULT_CGROUPV2_PATH,
+            CGROUPV2_DEFAULT_PATH,
             Some(Box::new(move |typ, cmd| {
                 assert_eq!(typ, &PrivilegeOpType::CreateNode);
                 assert_eq!(cmd, format!("mkdir -p /sys/fs/cgroup/{}", node_name_clone));
@@ -656,7 +738,7 @@ mod tests {
         let node_name = "a\\b'\"   !_12345";
 
         let ctl = CgroupController::new(
-            DEFAULT_CGROUPV2_PATH,
+            CGROUPV2_DEFAULT_PATH,
             Some(Box::new(move |typ, cmd| {
                 assert_eq!(typ, &PrivilegeOpType::CreateNode);
                 assert_eq!(cmd, "mkdir -p '/sys/fs/cgroup/a\\b'\\''\"   '\\!'_12345'");
@@ -680,9 +762,27 @@ mod tests {
         let node_name = random_name("test_node");
 
         let ctl =
-            CgroupController::new(DEFAULT_CGROUPV2_PATH, Some(Box::new(request_func_example)));
+            CgroupController::new(CGROUPV2_DEFAULT_PATH, Some(Box::new(request_func_example)));
         let root = ctl.get_root_node().unwrap();
 
         let _test_node = ctl.create_from_node_path(&root, &PathBuf::from(node_name), true);
+    }
+
+    #[test]
+    fn request_func_test_move() {
+        nonroot_only!();
+        let ctl = CgroupController::new(
+            CGROUPV2_DEFAULT_PATH,
+            Some(Box::new(move |typ, cmd| {
+                assert_eq!(typ, &PrivilegeOpType::MoveProcess);
+                assert_eq!(
+                    cmd,
+                    format!("echo {} > /sys/fs/cgroup/cgroup.procs", std::process::id(),)
+                );
+                Ok(())
+            })),
+        );
+        let mut root = ctl.get_root_node().unwrap();
+        let _ = root.move_process(Pid::from_raw(std::process::id() as i32));
     }
 }
