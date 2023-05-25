@@ -2,6 +2,11 @@
 name = "cgumi"
 version = "0.0.1"
 edition = "2021"
+license = "MIT"
+description = "cgumi is yet another crate for interacting with cgroupv2"
+repository = "https://github.com/taoky/cgumi"
+homepage = "https://github.com/taoky/cgumi"
+readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -10,10 +15,19 @@ log = "0.4.17"
 nix = "0.26.2"
 shell-escape = "0.1.5"
 thiserror = "1.0.40"
-zbus = "3.13.1"
+zbus = { version = "3.13.1", optional = true }
 
 [dev-dependencies]
 env_logger = "0.9"
 test-log = "0.2.11"
 rand = "0.8.5"
 chrono = "0.4.24"
+
+[features]
+default = ["systemd"]
+systemd = ["zbus"]
+
+[[example]]
+name = "maxmem_systemd"
+path = "examples/maxmem_systemd/main.rs"
+required-features = ["systemd"]

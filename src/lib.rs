@@ -2,16 +2,23 @@ use nix::unistd::{chown, Pid, Uid};
 use shell_escape::unix::escape;
 use std::{num::ParseIntError, path::PathBuf, str::FromStr};
 use thiserror::Error;
+
+#[cfg(feature = "systemd")]
 use zbus::blocking::Connection;
 
 #[macro_use]
 extern crate log;
 
 pub mod utils;
+
+#[cfg(feature = "systemd")]
 mod zbus_systemd;
 
+/// The default path of Cgroupv2 on most Linux systems.
+/// Systemd hybrid cgroup mode is NOT tested and this path is not applicable in this case.
 pub const CGROUPV2_DEFAULT_PATH: &str = "/sys/fs/cgroup/";
 
+/// All functions in cgumi use `CgroupError` as the returned error type.
 #[derive(Error, Debug)]
 pub enum CgroupError {
     #[error("error when creating cgroup node: {0}")]
@@ -28,10 +35,13 @@ pub enum CgroupError {
     InvalidOperation(String),
     #[error("error when requesting user: {0}")]
     RequestUserError(std::io::Error),
+    #[cfg(feature = "systemd")]
     #[error("error when using systemd: {0}")]
     SystemdError(zbus::Error),
 }
 
+/// Available values for `cgroup.subtree_control`.
+/// `SubtreeControl::Others(String)` is for new, unknown control type.
 #[derive(PartialEq, Debug)]
 pub enum SubtreeControl {
     Cpuset,
@@ -79,6 +89,7 @@ impl FromStr for SubtreeControl {
     }
 }
 
+/// Different value in `DelegateMode` indicates different file to be chown(2)ed.
 pub enum DelegateMode {
     DelegateNewSubtree,
     DelegateProcs,
@@ -90,6 +101,7 @@ fn nix_to_io_error(nix_error: nix::Error) -> std::io::Error {
     std::io::Error::from_raw_os_error(nix_error as i32)
 }
 
+/// `IOStat` contains information in every line of `io.stat`.
 #[derive(Debug, Default, Clone)]
 pub struct IOStat {
     pub device: String,
@@ -101,6 +113,8 @@ pub struct IOStat {
     pub dios: u64,
 }
 
+/// Privilege operations that may need to be elevated to do.
+/// This enum helps request helper function to show proper prompts to user.
 #[derive(Debug, PartialEq)]
 pub enum PrivilegeOpType {
     CreateNode,
@@ -112,6 +126,8 @@ pub enum PrivilegeOpType {
 
 type RequestClosure = Box<dyn Fn(&PrivilegeOpType, &str) -> Result<(), std::io::Error>>;
 
+/// `CgroupController` is the main component in cgumi, and it should always be created first.
+/// All `CgroupNode` should be created by `CgroupController`.
 pub struct CgroupController {
     root: PathBuf,
     request_func: Option<RequestClosure>,
@@ -136,6 +152,8 @@ impl Default for CgroupController {
 }
 
 impl CgroupController {
+    /// `root` is the cgroupv2 mountpoint, and `request_func` is an optional
+    /// function that prompts users to run commands in root permission.
     pub fn new(root: &str, request_func: Option<RequestClosure>) -> Self {
         Self {
             root: root.into(),
@@ -147,6 +165,7 @@ impl CgroupController {
         &self.root
     }
 
+    /// Create a `CgroupNode` from a relative path (`name`).
     pub fn create_from_path(
         &self,
         name: &PathBuf,
@@ -179,6 +198,7 @@ impl CgroupController {
         }
     }
 
+    /// Get the `CgroupNode` from what current program is in.
     pub fn get_from_current(&self) -> Result<CgroupNode, CgroupError> {
         // Get cgroup path from /proc/self/cgroup
         let cgroup_file_contents =
@@ -203,6 +223,7 @@ impl CgroupController {
         CgroupNode::create(&path, true, self.request_func.as_ref())
     }
 
+    /// Create a `CgroupNode` from a `node` and a `name` relative to the node.
     pub fn create_from_node_path(
         &self,
         node: &CgroupNode,
@@ -218,10 +239,13 @@ impl CgroupController {
         self.create_from_path(&node.path.join(name), allow_exists)
     }
 
+    /// Get the root as a `CgroupNode`.
     pub fn get_root_node(&self) -> Result<CgroupNode, CgroupError> {
         CgroupNode::create(&self.root, true, self.request_func.as_ref())
     }
 
+    /// Create a systemd scope, and therefore get a cgroup node from that.
+    #[cfg(feature = "systemd")]
     pub fn create_systemd_cgroup(&self, name: &str) -> Result<CgroupNode, CgroupError> {
         let connection = Connection::session().map_err(CgroupError::SystemdError)?;
         let systemd_manager = zbus_systemd::ManagerProxyBlocking::new(&connection)
@@ -265,6 +289,8 @@ impl CgroupController {
     }
 }
 
+/// `CgroupNode` is created by `CgroupController`,
+/// and operations other than creation is implemented in `CgroupNode`.
 pub struct CgroupNode<'a> {
     path: PathBuf,
     request_func: Option<&'a RequestClosure>,
@@ -284,7 +310,7 @@ impl CgroupNode<'_> {
         &self.path
     }
 
-    pub fn create<'a>(
+    pub(crate) fn create<'a>(
         path: &PathBuf,
         allow_exists: bool,
         request_func: Option<&'a RequestClosure>,
@@ -311,6 +337,7 @@ impl CgroupNode<'_> {
         })
     }
 
+    /// Get children nodes
     pub fn children(&self) -> Result<Vec<CgroupNode>, CgroupError> {
         let mut res = Vec::new();
         for entry in self.path.read_dir().map_err(CgroupError::ReadFileError)? {
@@ -326,6 +353,9 @@ impl CgroupNode<'_> {
         Ok(res)
     }
 
+    /// Move processes from other cgroup nodes to this.
+    /// You don't need to know where the original node pid is in (and this is how cgroupv2 works).
+    /// Note that we call it "move", not "add", as EVERY process is in cgroupv2.
     pub fn move_process(&mut self, pid: Pid) -> Result<(), CgroupError> {
         let pid_str = pid.to_string();
         let procs_path = self.path.join("cgroup.procs");
@@ -354,6 +384,8 @@ impl CgroupNode<'_> {
         }
     }
 
+    /// `cleanup()` tries moving processes inside node to other ones.
+    /// It is executed recursively.
     pub fn cleanup(&self, dst_node: &mut CgroupNode) -> Result<(), CgroupError> {
         if dst_node.path.starts_with(&self.path) {
             return Err(CgroupError::InvalidOperation(
@@ -370,6 +402,8 @@ impl CgroupNode<'_> {
         Ok(())
     }
 
+    /// `destroy()` tries removing the cgroup node.
+    /// It is executed recursively.
     pub fn destroy(self) -> Result<(), CgroupError> {
         for child in self.children()? {
             child.destroy()?;
@@ -394,6 +428,8 @@ impl CgroupNode<'_> {
         }
     }
 
+    /// Parse and get process PIDs inside node by reading `cgroup.procs`.
+    /// It is NOT recursively executed.
     pub fn get_pid_list(&self) -> Result<Vec<Pid>, CgroupError> {
         // read cgroup.procs file
         let pid_list_contents = std::fs::read_to_string(self.path.join("cgroup.procs"))
@@ -409,6 +445,7 @@ impl CgroupNode<'_> {
         })
     }
 
+    /// Get subtree controls information from current node.
     pub fn get_subtree_controls(&self) -> Result<Vec<SubtreeControl>, CgroupError> {
         let subtree_control_contents =
             std::fs::read_to_string(self.path.join("cgroup.subtree_control"))
@@ -421,6 +458,9 @@ impl CgroupNode<'_> {
             .collect()
     }
 
+    /// Modify subtree controls in current node.
+    /// Note that, due to "no internal processes" rule, unless you are operating a root node,
+    /// a node cannot have both subtree controls and PIDs inside.
     pub fn adjust_subtree_controls(
         &mut self,
         add_list: &[SubtreeControl],
@@ -463,6 +503,7 @@ impl CgroupNode<'_> {
         }
     }
 
+    /// Use `chown` to delegate parts of cgroup nodes to users other than root.
     pub fn delegate(&mut self, uid: Uid, modes: &[DelegateMode]) -> Result<(), CgroupError> {
         for mode in modes {
             let file = match mode {
@@ -499,6 +540,7 @@ impl CgroupNode<'_> {
         Ok(())
     }
 
+    /// Parse `memory.peak` and get peak memory usage in current cgroup node.
     pub fn get_memory_peak(&self) -> Result<u64, CgroupError> {
         let contents = std::fs::read_to_string(self.path.join("memory.peak"))
             .map_err(CgroupError::ReadFileError)?;
@@ -507,6 +549,7 @@ impl CgroupNode<'_> {
         })
     }
 
+    /// Parse `io.stat` and get I/O statistics in current cgroup node.
     pub fn get_io_stat(&self) -> Result<Vec<IOStat>, CgroupError> {
         macro_rules! invalid_format_error {
             () => {
@@ -834,5 +877,14 @@ mod tests {
         );
         let mut root = ctl.get_root_node().unwrap();
         let _ = root.move_process(Pid::from_raw(std::process::id() as i32));
+    }
+
+    #[cfg(feature = "systemd")]
+    #[test]
+    fn systemd_scope_test() {
+        nonroot_only!();
+
+        let ctl = CgroupController::default();
+        ctl.create_systemd_cgroup("cgumi-unittest").unwrap();
     }
 }

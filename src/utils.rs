@@ -31,8 +31,16 @@ pub(crate) fn u32_to_bytes(x: u32, buf: &mut [u8]) -> usize {
     }
 }
 
-// This utility function does not do heap memory allocation
-// And thus safe to use inside pre_exec
+/// This utility function writes PID (u32) string to a file (usually cgroup.procs).
+/// It does not do heap memory allocation, and thus suitable to use inside pre_exec.
+/// 
+/// # Examples
+/// 
+/// ```
+/// unsafe {
+///     cmd.pre_exec(move || cgumi::utils::add_self_to_proc(procs_fd, std::process::id()));
+/// }
+/// ```
 pub fn add_self_to_proc(fd: i32, pid: u32) -> Result<(), std::io::Error> {
     let mut buf = [0u8; 32];
     let len = u32_to_bytes(pid, &mut buf);
@@ -41,6 +49,15 @@ pub fn add_self_to_proc(fd: i32, pid: u32) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// This utility function opens cgroup.procs file in given `CgroupNode`
+/// and returns the fd number (i32).
+/// 
+/// # Examples
+/// 
+/// ```
+/// let procs_fd = cgumi::utils::get_cgroup_proc_fd(&node).unwrap();
+/// // and the procs_fd can be used in add_self_to_proc()
+/// ```
 pub fn get_cgroup_proc_fd(node: &CgroupNode) -> Result<i32, std::io::Error> {
     open(
         node.path.join("cgroup.procs").as_os_str(),
@@ -50,7 +67,16 @@ pub fn get_cgroup_proc_fd(node: &CgroupNode) -> Result<i32, std::io::Error> {
     .map_err(nix_to_io_error)
 }
 
-// An example request function with sudo
+/// An example request function which requests user permission and runs `sudo`.
+/// 
+/// # Examples
+/// 
+/// ```
+/// let ctl = cgumi::CgroupController::new(
+///     cgumi::CGROUPV2_DEFAULT_PATH,
+///     Some(Box::new(cgumi::utils::sudo_request_func)),
+/// );
+/// ```
 pub fn sudo_request_func(pri: &PrivilegeOpType, cmd: &str) -> Result<(), std::io::Error> {
     eprint!(
         "{}",
