@@ -13,17 +13,17 @@ fn main() {
     env_logger::init();
 
     let ctl = cgumi::CgroupController::default();
-    let mut node = ctl.create_systemd_cgroup("cgumi-test").unwrap();
+    let node = ctl.create_systemd_cgroup("cgumi-test").unwrap();
     info!("Created node: {}", node.path().display());
 
-    let test_node2 = ctl
+    let inside_node = ctl
         .create_from_node_path(&node, &PathBuf::from("test-node-inside"), false)
         .unwrap();
-    let mut test_hostprog = ctl
-        .create_from_node_path(&node, &PathBuf::from("test-host"), false)
+    let parent_node = ctl
+        .create_from_node_path(&node, &PathBuf::from("test-parent"), false)
         .unwrap();
 
-    test_hostprog.move_process(Pid::this()).unwrap();
+    parent_node.move_process(Pid::this()).unwrap();
 
     // Add memory control to the node
     node.adjust_subtree_controls(&[cgumi::SubtreeControl::Memory], &[])
@@ -34,7 +34,7 @@ fn main() {
     let cmd = cmd.args(["-c", "x = [0] * 1024 * 1024"]);
 
     // Preparing for pre_exec
-    let procs_fd = cgumi::utils::get_cgroup_proc_fd(&test_node2).unwrap();
+    let procs_fd = cgumi::utils::get_cgroup_proc_fd(&inside_node).unwrap();
 
     unsafe {
         cmd.pre_exec(move || cgumi::utils::add_self_to_proc(procs_fd, std::process::id()));
@@ -52,7 +52,7 @@ fn main() {
         }
     }
 
-    let peak = test_node2.get_memory_peak().unwrap();
+    let peak = inside_node.get_memory_peak().unwrap();
 
     println!("Peak mem usage: {} Bytes", peak);
 }

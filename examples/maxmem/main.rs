@@ -22,16 +22,15 @@ fn main() {
     // Currently just create a new cgroup node under root
     let mut root = ctl.get_root_node().unwrap();
     let test_name = format!("test-node-{}", rand::random::<u32>());
-    let mut test_node = ctl
+    let node = ctl
         .create_from_node_path(&root, &PathBuf::from(test_name), false)
         .unwrap();
-    let test_node2 = ctl
-        .create_from_node_path(&test_node, &PathBuf::from("test-node-inside"), false)
+    let node_inside = ctl
+        .create_from_node_path(&node, &PathBuf::from("test-node-inside"), false)
         .unwrap();
 
     // Add memory control to the node
-    test_node
-        .adjust_subtree_controls(&[cgumi::SubtreeControl::Memory], &[])
+    node.adjust_subtree_controls(&[cgumi::SubtreeControl::Memory], &[])
         .unwrap();
 
     // Create example app
@@ -39,7 +38,7 @@ fn main() {
     let cmd = cmd.args(["-c", "x = [0] * 1024 * 1024"]);
 
     // Preparing for pre_exec
-    let procs_fd = cgumi::utils::get_cgroup_proc_fd(&test_node2).unwrap();
+    let procs_fd = cgumi::utils::get_cgroup_proc_fd(&node_inside).unwrap();
 
     unsafe {
         cmd.pre_exec(move || cgumi::utils::add_self_to_proc(procs_fd, std::process::id()));
@@ -57,10 +56,10 @@ fn main() {
         }
     }
 
-    let peak = test_node2.get_memory_peak().unwrap();
+    let peak = node_inside.get_memory_peak().unwrap();
 
     println!("Peak mem usage: {} Bytes", peak);
 
-    test_node.cleanup(&mut root).unwrap();
-    test_node.destroy().unwrap();
+    node.cleanup(&mut root).unwrap();
+    node.destroy().unwrap();
 }

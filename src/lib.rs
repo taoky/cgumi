@@ -171,8 +171,7 @@ impl CgroupController {
         name: &PathBuf,
         allow_exists: bool,
     ) -> Result<CgroupNode, CgroupError> {
-        let mut path = PathBuf::from(&self.root);
-        path.push(name);
+        let path = PathBuf::from(&self.root).join(name);
         let res = CgroupNode::create(&path, allow_exists, self.request_func.as_ref());
         match res {
             Ok(res) => Ok(res),
@@ -215,8 +214,7 @@ impl CgroupController {
 
         let relative_cgroup = hierarchy_list[2].trim_start_matches('/');
 
-        let mut path = PathBuf::from(&self.root);
-        path.push(relative_cgroup);
+        let path = PathBuf::from(&self.root).join(relative_cgroup);
 
         debug!("cgroup path: {:?}", path);
 
@@ -356,7 +354,7 @@ impl CgroupNode<'_> {
     /// Move processes from other cgroup nodes to this.
     /// You don't need to know where the original node pid is in (and this is how cgroupv2 works).
     /// Note that we call it "move", not "add", as EVERY process is in cgroupv2.
-    pub fn move_process(&mut self, pid: Pid) -> Result<(), CgroupError> {
+    pub fn move_process(&self, pid: Pid) -> Result<(), CgroupError> {
         let pid_str = pid.to_string();
         let procs_path = self.path.join("cgroup.procs");
         let res = std::fs::write(&procs_path, &pid_str);
@@ -386,7 +384,7 @@ impl CgroupNode<'_> {
 
     /// `cleanup()` tries moving processes inside node to other ones.
     /// It is executed recursively.
-    pub fn cleanup(&self, dst_node: &mut CgroupNode) -> Result<(), CgroupError> {
+    pub fn cleanup(&self, dst_node: &CgroupNode) -> Result<(), CgroupError> {
         if dst_node.path.starts_with(&self.path) {
             return Err(CgroupError::InvalidOperation(
                 "cleanup dst node is under src node".into(),
@@ -404,6 +402,15 @@ impl CgroupNode<'_> {
 
     /// `destroy()` tries removing the cgroup node.
     /// It is executed recursively.
+    /// Please note that you need to handle the invalidation of existing nodes yourself, like:
+    ///
+    /// ```ignore
+    /// let node1 = ...
+    /// let node2 = ctl.create_from_node_path(&node1, &PathBuf::from("test"), false);
+    /// node1.destroy();
+    /// // This will NOT cause compile error, but node2 is invalid now.
+    /// // You need to identify this yourself.
+    /// ```
     pub fn destroy(self) -> Result<(), CgroupError> {
         for child in self.children()? {
             child.destroy()?;
@@ -462,7 +469,7 @@ impl CgroupNode<'_> {
     /// Note that, due to "no internal processes" rule, unless you are operating a root node,
     /// a node cannot have both subtree controls and PIDs inside.
     pub fn adjust_subtree_controls(
-        &mut self,
+        &self,
         add_list: &[SubtreeControl],
         remove_list: &[SubtreeControl],
     ) -> Result<(), CgroupError> {
@@ -504,7 +511,7 @@ impl CgroupNode<'_> {
     }
 
     /// Use `chown` to delegate parts of cgroup nodes to users other than root.
-    pub fn delegate(&mut self, uid: Uid, modes: &[DelegateMode]) -> Result<(), CgroupError> {
+    pub fn delegate(&self, uid: Uid, modes: &[DelegateMode]) -> Result<(), CgroupError> {
         for mode in modes {
             let file = match mode {
                 DelegateMode::DelegateNewSubtree => ".",
@@ -686,8 +693,8 @@ mod tests {
     }
 
     fn cleanup_node(ctl: &CgroupController, node: CgroupNode) {
-        let mut root = ctl.get_root_node().unwrap();
-        node.cleanup(&mut root).unwrap();
+        let root = ctl.get_root_node().unwrap();
+        node.cleanup(&root).unwrap();
         node.destroy().unwrap();
     }
 
@@ -705,7 +712,7 @@ mod tests {
     fn delegation_test() {
         root_only!();
         let ctl = CgroupController::default();
-        let mut test_node = create_test_node_on_root_node(&ctl);
+        let test_node = create_test_node_on_root_node(&ctl);
 
         test_node
             .delegate(
@@ -725,7 +732,7 @@ mod tests {
     fn subtree_test() {
         root_only!();
         let ctl = CgroupController::default();
-        let mut test_node = create_test_node_on_root_node(&ctl);
+        let test_node = create_test_node_on_root_node(&ctl);
 
         let subtree = test_node.get_subtree_controls().unwrap();
         debug!("{:?}", subtree);
@@ -766,7 +773,7 @@ mod tests {
         let pid = Pid::from_raw(handle.id() as i32);
 
         let ctl = CgroupController::default();
-        let mut test_node = create_test_node_on_root_node(&ctl);
+        let test_node = create_test_node_on_root_node(&ctl);
 
         test_node.move_process(pid).unwrap();
         let pid_list = test_node.get_pid_list().unwrap();
@@ -875,7 +882,7 @@ mod tests {
                 Ok(())
             })),
         );
-        let mut root = ctl.get_root_node().unwrap();
+        let root = ctl.get_root_node().unwrap();
         let _ = root.move_process(Pid::from_raw(std::process::id() as i32));
     }
 

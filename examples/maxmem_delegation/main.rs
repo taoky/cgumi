@@ -25,7 +25,7 @@ fn main() {
     // Currently just create a new cgroup node under root
     let mut root = ctl.get_root_node().unwrap();
     let test_name = format!("test-node-{}", rand::random::<u32>());
-    let mut test_node = ctl
+    let test_node = ctl
         .create_from_node_path(&root, &PathBuf::from(test_name), false)
         .unwrap();
     test_node
@@ -37,21 +37,21 @@ fn main() {
             ],
         )
         .unwrap();
-    let mut test_node2 = ctl
+    let inside_node = ctl
         .create_from_node_path(&test_node, &PathBuf::from("test-node-inside"), false)
         .unwrap();
-    let mut test_hostprog = ctl
-        .create_from_node_path(&test_node, &PathBuf::from("test-host"), false)
+    let parent_node = ctl
+        .create_from_node_path(&test_node, &PathBuf::from("test-parent"), false)
         .unwrap();
 
     // Delegation
-    test_hostprog
+    parent_node
         .delegate(Uid::current(), &[DelegateMode::DelegateProcs])
         .unwrap();
-    test_node2
+    inside_node
         .delegate(Uid::current(), &[DelegateMode::DelegateProcs])
         .unwrap();
-    test_hostprog.move_process(Pid::this()).unwrap();
+    parent_node.move_process(Pid::this()).unwrap();
 
     // Add memory control to the node
     test_node
@@ -63,7 +63,7 @@ fn main() {
     let cmd = cmd.args(["-c", "x = [0] * 1024 * 1024"]);
 
     // Preparing for pre_exec
-    let procs_fd = cgumi::utils::get_cgroup_proc_fd(&test_node2).unwrap();
+    let procs_fd = cgumi::utils::get_cgroup_proc_fd(&inside_node).unwrap();
 
     unsafe {
         cmd.pre_exec(move || cgumi::utils::add_self_to_proc(procs_fd, std::process::id()));
@@ -81,7 +81,7 @@ fn main() {
         }
     }
 
-    let peak = test_node2.get_memory_peak().unwrap();
+    let peak = inside_node.get_memory_peak().unwrap();
 
     println!("Peak mem usage: {} Bytes", peak);
 
