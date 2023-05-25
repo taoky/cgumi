@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 log = "0.4.17"
 nix = "0.26.2"
+shell-escape = "0.1.5"
 thiserror = "1.0.40"
 
 [dev-dependencies]

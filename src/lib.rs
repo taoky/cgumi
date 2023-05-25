@@ -1,4 +1,5 @@
 use nix::unistd::{chown, Pid, Uid};
+use shell_escape::unix::escape;
 use std::{num::ParseIntError, path::PathBuf, str::FromStr};
 use thiserror::Error;
 
@@ -23,6 +24,8 @@ pub enum CgroupError {
     DelegateError(std::io::Error),
     #[error("invalid operation: {0}")]
     InvalidOperation(String),
+    #[error("error when requesting user: {0}")]
+    RequestUserError(std::io::Error),
 }
 
 #[derive(PartialEq, Debug)]
@@ -94,22 +97,45 @@ pub struct IOStat {
     pub dios: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
+pub enum PrivilegeOpType {
+    CreateNode,
+    DelegateNode,
+    RemoveNode,
+    MoveProcess,
+}
+
+type RequestClosure = Box<dyn Fn(&PrivilegeOpType, &str) -> Result<(), std::io::Error>>;
+
 pub struct CgroupController {
     root: PathBuf,
+    request_func: Option<RequestClosure>,
+}
+
+impl std::fmt::Debug for CgroupController {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CgroupController")
+            .field("root", &self.root)
+            .field("is request_func available", &self.request_func.is_some())
+            .finish()
+    }
 }
 
 impl Default for CgroupController {
     fn default() -> Self {
         Self {
             root: DEFAULT_CGROUPV2_PATH.into(),
+            request_func: None,
         }
     }
 }
 
 impl CgroupController {
-    pub fn new(root: &str) -> Self {
-        Self { root: root.into() }
+    pub fn new(root: &str, request_func: Option<RequestClosure>) -> Self {
+        Self {
+            root: root.into(),
+            request_func,
+        }
     }
 
     pub fn root(&self) -> &PathBuf {
@@ -123,7 +149,29 @@ impl CgroupController {
     ) -> Result<CgroupNode, CgroupError> {
         let mut path = PathBuf::from(&self.root);
         path.push(name);
-        CgroupNode::create(&path, allow_exists)
+        let res = CgroupNode::create(&path, allow_exists, self.request_func.as_ref());
+        match res {
+            Ok(res) => Ok(res),
+            Err(CgroupError::CreateNodeError(e)) => {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    if let Some(request_func) = &self.request_func {
+                        let command = if allow_exists {
+                            format!("mkdir -p {}", escape(path.to_string_lossy()))
+                        } else {
+                            format!("mkdir {}", escape(path.to_string_lossy()))
+                        };
+                        request_func(&PrivilegeOpType::CreateNode, &command)
+                            .map_err(CgroupError::RequestUserError)?;
+                        CgroupNode::create(&path, true, self.request_func.as_ref())
+                    } else {
+                        Err(CgroupError::CreateNodeError(e))
+                    }
+                } else {
+                    Err(CgroupError::CreateNodeError(e))
+                }
+            }
+            _ => unreachable!(),
+        }
     }
 
     pub fn get_from_current(&self) -> Result<CgroupNode, CgroupError> {
@@ -147,7 +195,7 @@ impl CgroupController {
 
         debug!("cgroup path: {:?}", path);
 
-        CgroupNode::create(&path, true)
+        CgroupNode::create(&path, true, self.request_func.as_ref())
     }
 
     pub fn create_from_node_path(
@@ -166,17 +214,30 @@ impl CgroupController {
     }
 
     pub fn get_root_node(&self) -> Result<CgroupNode, CgroupError> {
-        CgroupNode::create(&self.root, true)
+        CgroupNode::create(&self.root, true, self.request_func.as_ref())
     }
 }
 
-#[derive(Debug)]
-pub struct CgroupNode {
+pub struct CgroupNode<'a> {
     path: PathBuf,
+    request_func: Option<&'a RequestClosure>,
 }
 
-impl CgroupNode {
-    pub fn create(path: &PathBuf, allow_exists: bool) -> Result<CgroupNode, CgroupError> {
+impl std::fmt::Debug for CgroupNode<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CgroupNode")
+            .field("path", &self.path)
+            .field("is request_func available", &self.request_func.is_some())
+            .finish()
+    }
+}
+
+impl CgroupNode<'_> {
+    pub fn create<'a>(
+        path: &PathBuf,
+        allow_exists: bool,
+        request_func: Option<&'a RequestClosure>,
+    ) -> Result<CgroupNode<'a>, CgroupError> {
         if path.exists() {
             if !allow_exists {
                 return Err(CgroupError::CreateNodeError(std::io::Error::new(
@@ -184,13 +245,19 @@ impl CgroupNode {
                     "cgroup node already exists",
                 )));
             } else {
-                return Ok(CgroupNode { path: path.clone() });
+                return Ok(CgroupNode {
+                    path: path.clone(),
+                    request_func,
+                });
             }
         }
 
         std::fs::create_dir_all(path).map_err(CgroupError::CreateNodeError)?;
 
-        Ok(CgroupNode { path: path.clone() })
+        Ok(CgroupNode {
+            path: path.clone(),
+            request_func,
+        })
     }
 
     pub fn children(&self) -> Result<Vec<CgroupNode>, CgroupError> {
@@ -202,7 +269,7 @@ impl CgroupNode {
                 .map_err(CgroupError::ReadFileError)?
                 .is_dir()
             {
-                res.push(CgroupNode::create(&entry.path(), true)?);
+                res.push(CgroupNode::create(&entry.path(), true, self.request_func)?);
             }
         }
         Ok(res)
@@ -375,6 +442,15 @@ mod tests {
         };
     }
 
+    macro_rules! nonroot_only {
+        () => {
+            if is_root() {
+                warn!("Running as root, skipping");
+                return;
+            }
+        };
+    }
+
     #[test]
     fn get_current_node_pid() {
         let ctl = CgroupController::default();
@@ -420,9 +496,13 @@ mod tests {
         assert!(stats.len() > 0);
     }
 
+    fn random_name(s: &str) -> String {
+        format!("{}_{}", s, rand::random::<u64>())
+    }
+
     fn create_test_node_on_root_node(ctl: &CgroupController) -> CgroupNode {
         // randomly generate a test node
-        let test_node_name = format!("test_node_{}", rand::random::<u64>());
+        let test_node_name = random_name("test_node");
         let root = ctl.get_root_node().unwrap();
         let test_node = ctl
             .create_from_node_path(&root, &PathBuf::from(test_node_name), true)
@@ -547,5 +627,62 @@ mod tests {
         assert_eq!(buf[7], b'8');
         assert_eq!(buf[8], b'9');
         assert_eq!(buf[9], b'0');
+    }
+
+    #[test]
+    fn request_func_test_create() {
+        nonroot_only!();
+
+        let node_name = random_name("test_node");
+
+        let node_name_clone = node_name.clone();
+        let ctl = CgroupController::new(
+            DEFAULT_CGROUPV2_PATH,
+            Some(Box::new(move |typ, cmd| {
+                assert_eq!(typ, &PrivilegeOpType::CreateNode);
+                assert_eq!(cmd, format!("mkdir -p /sys/fs/cgroup/{}", node_name_clone));
+                Ok(())
+            })),
+        );
+        let root = ctl.get_root_node().unwrap();
+
+        let _test_node = ctl.create_from_node_path(&root, &PathBuf::from(node_name), true);
+    }
+
+    #[test]
+    fn request_func_test_create_escape() {
+        nonroot_only!();
+
+        let node_name = "a\\b'\"   !_12345";
+
+        let ctl = CgroupController::new(
+            DEFAULT_CGROUPV2_PATH,
+            Some(Box::new(move |typ, cmd| {
+                assert_eq!(typ, &PrivilegeOpType::CreateNode);
+                assert_eq!(cmd, "mkdir -p '/sys/fs/cgroup/a\\b'\\''\"   '\\!'_12345'");
+                Ok(())
+            })),
+        );
+        let root = ctl.get_root_node().unwrap();
+
+        let _test_node = ctl.create_from_node_path(&root, &PathBuf::from(node_name), true);
+    }
+
+    fn request_func_example(pri: &PrivilegeOpType, cmd: &str) -> Result<(), std::io::Error> {
+        println!("{:?}: {}", pri, cmd);
+        Ok(())
+    }
+
+    #[test]
+    fn request_func_test_create_example() {
+        nonroot_only!();
+
+        let node_name = random_name("test_node");
+
+        let ctl =
+            CgroupController::new(DEFAULT_CGROUPV2_PATH, Some(Box::new(request_func_example)));
+        let root = ctl.get_root_node().unwrap();
+
+        let _test_node = ctl.create_from_node_path(&root, &PathBuf::from(node_name), true);
     }
 }

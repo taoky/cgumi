@@ -1,11 +1,15 @@
 // Execute a program, and print out its maximum mem usage after it exits.
 // It works by:
 // 1. Create an empty cgroup node (call it as NODE1 here)
-// 2. As limited by "no internal processes" rule, an extra empty cgroup node (called as NODE11) should be created inside
+// 2. As limited by "no internal processes" rule[^1], an extra empty cgroup node (called as NODE11) should be created inside
 // 3. Add "memory" subtree control to NODE1 (and thus NODE11 gets memory control!)
 // 4. Fork process, and before exec(), put the process into NODE11 (UNSAFE!)
 // 5. After wait() done, the parent gathers the memory usage of NODE11, and print it out.
 // 6. Remove NODE11 and NODE1
+
+// [^1]: Extra empty node is not necessary if the empty node created before has already got memory control.
+//       However, you may find it required when using delegated controllers and you need to measure multiple processes
+//       Thus in this example we still create an extra empty node.
 
 use std::{os::unix::process::CommandExt, path::PathBuf};
 

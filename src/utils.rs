@@ -1,13 +1,15 @@
+use std::process::Command;
+
 use nix::{
     fcntl::{open, OFlag},
     sys::stat::Mode,
     unistd::{close, write},
 };
 
-use crate::{nix_to_io_error, CgroupNode};
+use crate::{nix_to_io_error, CgroupNode, PrivilegeOpType};
 
 // An u32 to bytes utility function for limited env
-fn u32_to_bytes(x: u32, buf: &mut [u8]) -> usize {
+pub(crate) fn u32_to_bytes(x: u32, buf: &mut [u8]) -> usize {
     if x == 0 {
         buf[0] = b'0';
         1
@@ -46,4 +48,41 @@ pub fn get_cgroup_proc_fd(node: &CgroupNode) -> Result<i32, std::io::Error> {
         Mode::empty(),
     )
     .map_err(nix_to_io_error)
+}
+
+// An example request function with sudo
+pub fn sudo_request_func(pri: &PrivilegeOpType, cmd: &str) -> Result<(), std::io::Error> {
+    eprint!(
+        "{}",
+        match pri {
+            PrivilegeOpType::CreateNode => "A cgroup node needs to be created.",
+            PrivilegeOpType::RemoveNode => "A cgroup node needs to be removed.",
+            PrivilegeOpType::DelegateNode => "A cgroup node needs to be delegated.",
+            PrivilegeOpType::MoveProcess => "A process needs to be moved to a cgroup node.",
+        }
+    );
+    eprintln!(" Thus the following script will be run with /bin/sh by sudo:");
+    eprintln!("{}", cmd);
+    eprint!("Continue? [y/N] ");
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    if input.trim() == "y" {
+        let mut sh: Command = Command::new("sudo");
+        sh.args(["/bin/sh", "-c", cmd]);
+        let res = sh.spawn()?.wait()?;
+        if !res.success() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Sudo failed.",
+            ))
+        } else {
+            Ok(())
+        }
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "User canceled.",
+        ))
+    }
 }
