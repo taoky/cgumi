@@ -59,7 +59,8 @@ pub fn sudo_request_func(pri: &PrivilegeOpType, cmd: &str) -> Result<(), std::io
             PrivilegeOpType::RemoveNode => "A cgroup node needs to be removed.",
             PrivilegeOpType::DelegateNode => "A cgroup node needs to be delegated.",
             PrivilegeOpType::MoveProcess => "A process needs to be moved to a cgroup node.",
-            PrivilegeOpType::AdjustSubtreeControls => "A cgroup's subtree control type needs to be adjusted.",
+            PrivilegeOpType::AdjustSubtreeControls =>
+                "A cgroup's subtree control type needs to be adjusted.",
         }
     );
     eprintln!(" Thus the following script will be run with /bin/sh by sudo:");

@@ -10,6 +10,7 @@ log = "0.4.17"
 nix = "0.26.2"
 shell-escape = "0.1.5"
 thiserror = "1.0.40"
+zbus = "3.13.1"
 
 [dev-dependencies]
 env_logger = "0.9"

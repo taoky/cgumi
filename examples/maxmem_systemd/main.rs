@@ -11,51 +11,29 @@
 
 use std::{os::unix::process::CommandExt, path::PathBuf};
 
-use cgumi::DelegateMode;
-use nix::unistd::{close, Pid, Uid};
+use log::info;
+use nix::unistd::{close, Pid};
 
 extern crate cgumi;
 
 fn main() {
-    // let ctl = cgumi::CgroupController::default();
-    let ctl = cgumi::CgroupController::new(
-        cgumi::CGROUPV2_DEFAULT_PATH,
-        Some(Box::new(cgumi::utils::sudo_request_func)),
-    );
-    // Currently just create a new cgroup node under root
-    let mut root = ctl.get_root_node().unwrap();
-    let test_name = format!("test-node-{}", rand::random::<u32>());
-    let mut test_node = ctl
-        .create_from_node_path(&root, &PathBuf::from(test_name), false)
-        .unwrap();
-    test_node
-        .delegate(
-            Uid::current(),
-            &[
-                DelegateMode::DelegateNewSubtree,
-                DelegateMode::DelegateProcs,
-            ],
-        )
-        .unwrap();
-    let mut test_node2 = ctl
-        .create_from_node_path(&test_node, &PathBuf::from("test-node-inside"), false)
+    env_logger::init();
+
+    let ctl = cgumi::CgroupController::default();
+    let mut node = ctl.create_systemd_cgroup("cgumi-test").unwrap();
+    info!("Created node: {}", node.path().display());
+
+    let test_node2 = ctl
+        .create_from_node_path(&node, &PathBuf::from("test-node-inside"), false)
         .unwrap();
     let mut test_hostprog = ctl
-        .create_from_node_path(&test_node, &PathBuf::from("test-host"), false)
+        .create_from_node_path(&node, &PathBuf::from("test-host"), false)
         .unwrap();
 
-    // Delegation
-    test_hostprog
-        .delegate(Uid::current(), &[DelegateMode::DelegateProcs])
-        .unwrap();
-    test_node2
-        .delegate(Uid::current(), &[DelegateMode::DelegateProcs])
-        .unwrap();
     test_hostprog.move_process(Pid::this()).unwrap();
 
     // Add memory control to the node
-    test_node
-        .adjust_subtree_controls(&[cgumi::SubtreeControl::Memory], &[])
+    node.adjust_subtree_controls(&[cgumi::SubtreeControl::Memory], &[])
         .unwrap();
 
     // Create example app
@@ -84,7 +62,4 @@ fn main() {
     let peak = test_node2.get_memory_peak().unwrap();
 
     println!("Peak mem usage: {} Bytes", peak);
-
-    test_node.cleanup(&mut root).unwrap();
-    test_node.destroy().unwrap();
 }

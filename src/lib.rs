@@ -2,11 +2,13 @@ use nix::unistd::{chown, Pid, Uid};
 use shell_escape::unix::escape;
 use std::{num::ParseIntError, path::PathBuf, str::FromStr};
 use thiserror::Error;
+use zbus::blocking::Connection;
 
 #[macro_use]
 extern crate log;
 
 pub mod utils;
+mod zbus_systemd;
 
 pub const CGROUPV2_DEFAULT_PATH: &str = "/sys/fs/cgroup/";
 
@@ -26,6 +28,8 @@ pub enum CgroupError {
     InvalidOperation(String),
     #[error("error when requesting user: {0}")]
     RequestUserError(std::io::Error),
+    #[error("error when using systemd: {0}")]
+    SystemdError(zbus::Error),
 }
 
 #[derive(PartialEq, Debug)]
@@ -217,6 +221,48 @@ impl CgroupController {
     pub fn get_root_node(&self) -> Result<CgroupNode, CgroupError> {
         CgroupNode::create(&self.root, true, self.request_func.as_ref())
     }
+
+    pub fn create_systemd_cgroup(&self, name: &str) -> Result<CgroupNode, CgroupError> {
+        let connection = Connection::session().map_err(CgroupError::SystemdError)?;
+        let systemd_manager = zbus_systemd::ManagerProxyBlocking::new(&connection)
+            .map_err(CgroupError::SystemdError)?;
+        let pids = [Pid::this().as_raw() as u32];
+        let scope_name = format!("{}.scope", name);
+
+        let _err = systemd_manager.reset_failed_unit(&scope_name);
+
+        let removed_jobs = systemd_manager
+            .receive_job_removed()
+            .map_err(CgroupError::SystemdError)?;
+
+        let job = systemd_manager
+            .start_transient_unit(&scope_name, "replace", &[("PIDs", pids[..].into())], &[])
+            .map_err(CgroupError::SystemdError)?;
+
+        for signal in removed_jobs {
+            let args = signal.args().map_err(CgroupError::SystemdError)?;
+            if args.job == job.as_ref() {
+                break;
+            }
+        }
+
+        let scope_dbus_path = systemd_manager
+            .get_unit(&scope_name)
+            .map_err(CgroupError::SystemdError)?;
+        let systemd_scope = zbus_systemd::ScopeProxyBlocking::builder(&connection)
+            .path(scope_dbus_path)
+            .map_err(CgroupError::SystemdError)?
+            .build()
+            .map_err(CgroupError::SystemdError)?;
+        let cgroup_path = systemd_scope
+            .control_group()
+            .map_err(CgroupError::SystemdError)?;
+        let cgroup_path = cgroup_path.trim_start_matches('/');
+        let cgroup_full_path = PathBuf::from(&self.root).join(cgroup_path);
+        debug!("cgroup path: {:?}", cgroup_full_path);
+        let node = CgroupNode::create(&cgroup_full_path, true, None)?;
+        Ok(node)
+    }
 }
 
 pub struct CgroupNode<'a> {
@@ -234,6 +280,10 @@ impl std::fmt::Debug for CgroupNode<'_> {
 }
 
 impl CgroupNode<'_> {
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
+
     pub fn create<'a>(
         path: &PathBuf,
         allow_exists: bool,
