@@ -6,7 +6,7 @@ use nix::{
     unistd::{close, write},
 };
 
-use crate::{nix_to_io_error, CgroupNode, PrivilegeOpType};
+use crate::{nix_to_io_error, CgroupNode, PrivilegeOpType, Func};
 
 // An u32 to bytes utility function for limited env
 pub(crate) fn u32_to_bytes(x: u32, buf: &mut [u8]) -> usize {
@@ -58,7 +58,7 @@ pub fn add_self_to_proc(fd: i32, pid: u32) -> Result<(), std::io::Error> {
 /// let procs_fd = cgumi::utils::get_cgroup_proc_fd(&node).unwrap();
 /// // and the procs_fd can be used in add_self_to_proc()
 /// ```
-pub fn get_cgroup_proc_fd(node: &CgroupNode) -> Result<i32, std::io::Error> {
+pub fn get_cgroup_proc_fd<F>(node: &CgroupNode<F>) -> Result<i32, std::io::Error> where F: Func {
     open(
         node.path.join("cgroup.procs").as_os_str(),
         OFlag::O_WRONLY,

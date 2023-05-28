@@ -2,6 +2,7 @@ use nix::unistd::{chown, Pid, Uid};
 use shell_escape::unix::escape;
 use std::{num::ParseIntError, path::PathBuf, str::FromStr};
 use thiserror::Error;
+use trait_set::trait_set;
 
 #[cfg(feature = "systemd")]
 use zbus::blocking::Connection;
@@ -124,16 +125,24 @@ pub enum PrivilegeOpType {
     AdjustSubtreeControls,
 }
 
-type RequestClosure = Box<dyn Fn(&PrivilegeOpType, &str) -> Result<(), std::io::Error>>;
+trait_set! {
+    pub trait Func = Fn(&PrivilegeOpType, &str) -> Result<(), std::io::Error>;
+}
 
 /// `CgroupController` is the main component in cgumi, and it should always be created first.
 /// All `CgroupNode` should be created by `CgroupController`.
-pub struct CgroupController {
+pub struct CgroupController<F>
+where
+    F: Func,
+{
     root: PathBuf,
-    request_func: Option<RequestClosure>,
+    request_func: Option<Box<F>>,
 }
 
-impl std::fmt::Debug for CgroupController {
+impl<F> std::fmt::Debug for CgroupController<F>
+where
+    F: Func,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CgroupController")
             .field("root", &self.root)
@@ -142,7 +151,10 @@ impl std::fmt::Debug for CgroupController {
     }
 }
 
-impl Default for CgroupController {
+impl<F> Default for CgroupController<F>
+where
+    F: Func,
+{
     fn default() -> Self {
         Self {
             root: CGROUPV2_DEFAULT_PATH.into(),
@@ -151,13 +163,16 @@ impl Default for CgroupController {
     }
 }
 
-impl CgroupController {
+impl<F> CgroupController<F>
+where
+    F: Func,
+{
     /// `root` is the cgroupv2 mountpoint, and `request_func` is an optional
     /// function that prompts users to run commands in root permission.
-    pub fn new(root: &str, request_func: Option<RequestClosure>) -> Self {
+    pub fn new(root: &str, request_func: Option<F>) -> Self {
         Self {
             root: root.into(),
-            request_func,
+            request_func: request_func.map(Box::new),
         }
     }
 
@@ -170,9 +185,9 @@ impl CgroupController {
         &self,
         name: &PathBuf,
         allow_exists: bool,
-    ) -> Result<CgroupNode, CgroupError> {
+    ) -> Result<CgroupNode<F>, CgroupError> {
         let path = PathBuf::from(&self.root).join(name);
-        let res = CgroupNode::create(&path, allow_exists, self.request_func.as_ref());
+        let res = CgroupNode::create(&path, allow_exists, self.request_func.as_deref());
         match res {
             Ok(res) => Ok(res),
             Err(CgroupError::CreateNodeError(e)) => {
@@ -185,7 +200,7 @@ impl CgroupController {
                         };
                         request_func(&PrivilegeOpType::CreateNode, &command)
                             .map_err(CgroupError::RequestUserError)?;
-                        CgroupNode::create(&path, true, self.request_func.as_ref())
+                        CgroupNode::create(&path, true, self.request_func.as_deref())
                     } else {
                         Err(CgroupError::CreateNodeError(e))
                     }
@@ -198,7 +213,7 @@ impl CgroupController {
     }
 
     /// Get the `CgroupNode` from what current program is in.
-    pub fn get_from_current(&self) -> Result<CgroupNode, CgroupError> {
+    pub fn get_from_current(&self) -> Result<CgroupNode<F>, CgroupError> {
         // Get cgroup path from /proc/self/cgroup
         let cgroup_file_contents =
             std::fs::read_to_string("/proc/self/cgroup").map_err(CgroupError::ReadFileError)?;
@@ -218,16 +233,16 @@ impl CgroupController {
 
         debug!("cgroup path: {:?}", path);
 
-        CgroupNode::create(&path, true, self.request_func.as_ref())
+        CgroupNode::create(&path, true, self.request_func.as_deref())
     }
 
     /// Create a `CgroupNode` from a `node` and a `name` relative to the node.
     pub fn create_from_node_path(
         &self,
-        node: &CgroupNode,
+        node: &CgroupNode<F>,
         name: &PathBuf,
         allow_exists: bool,
-    ) -> Result<CgroupNode, CgroupError> {
+    ) -> Result<CgroupNode<F>, CgroupError> {
         if !node.path.starts_with(&self.root) {
             return Err(CgroupError::CreateNodeError(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -238,13 +253,13 @@ impl CgroupController {
     }
 
     /// Get the root as a `CgroupNode`.
-    pub fn get_root_node(&self) -> Result<CgroupNode, CgroupError> {
-        CgroupNode::create(&self.root, true, self.request_func.as_ref())
+    pub fn get_root_node(&self) -> Result<CgroupNode<F>, CgroupError> {
+        CgroupNode::create(&self.root, true, self.request_func.as_deref())
     }
 
     /// Create a systemd scope, and therefore get a cgroup node from that.
     #[cfg(feature = "systemd")]
-    pub fn create_systemd_cgroup(&self, name: &str) -> Result<CgroupNode, CgroupError> {
+    pub fn create_systemd_cgroup(&self, name: &str) -> Result<CgroupNode<F>, CgroupError> {
         let connection = Connection::session().map_err(CgroupError::SystemdError)?;
         let systemd_manager = zbus_systemd::ManagerProxyBlocking::new(&connection)
             .map_err(CgroupError::SystemdError)?;
@@ -289,12 +304,15 @@ impl CgroupController {
 
 /// `CgroupNode` is created by `CgroupController`,
 /// and operations other than creation is implemented in `CgroupNode`.
-pub struct CgroupNode<'a> {
+pub struct CgroupNode<'a, F>
+where
+    F: Func,
+{
     path: PathBuf,
-    request_func: Option<&'a RequestClosure>,
+    request_func: Option<&'a F>,
 }
 
-impl std::fmt::Debug for CgroupNode<'_> {
+impl<F> std::fmt::Debug for CgroupNode<'_, F> where F: Func {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CgroupNode")
             .field("path", &self.path)
@@ -303,7 +321,7 @@ impl std::fmt::Debug for CgroupNode<'_> {
     }
 }
 
-impl CgroupNode<'_> {
+impl<F> CgroupNode<'_, F> where F: Func {
     pub fn path(&self) -> &PathBuf {
         &self.path
     }
@@ -311,8 +329,8 @@ impl CgroupNode<'_> {
     pub(crate) fn create<'a>(
         path: &PathBuf,
         allow_exists: bool,
-        request_func: Option<&'a RequestClosure>,
-    ) -> Result<CgroupNode<'a>, CgroupError> {
+        request_func: Option<&'a F>,
+    ) -> Result<CgroupNode<'a, F>, CgroupError> {
         if path.exists() {
             if !allow_exists {
                 return Err(CgroupError::CreateNodeError(std::io::Error::new(
@@ -336,7 +354,7 @@ impl CgroupNode<'_> {
     }
 
     /// Get children nodes
-    pub fn children(&self) -> Result<Vec<CgroupNode>, CgroupError> {
+    pub fn children(&self) -> Result<Vec<CgroupNode<F>>, CgroupError> {
         let mut res = Vec::new();
         for entry in self.path.read_dir().map_err(CgroupError::ReadFileError)? {
             let entry = entry.map_err(CgroupError::ReadFileError)?;
@@ -384,7 +402,7 @@ impl CgroupNode<'_> {
 
     /// `cleanup()` tries moving processes inside node to other ones.
     /// It is executed recursively.
-    pub fn cleanup(&self, dst_node: &CgroupNode) -> Result<(), CgroupError> {
+    pub fn cleanup(&self, dst_node: &CgroupNode<F>) -> Result<(), CgroupError> {
         if dst_node.path.starts_with(&self.path) {
             return Err(CgroupError::InvalidOperation(
                 "cleanup dst node is under src node".into(),
@@ -635,7 +653,7 @@ mod tests {
 
     #[test]
     fn get_current_node_pid() {
-        let ctl = CgroupController::default();
+        let ctl = CgroupController::<_>::default();
         let node = ctl.get_from_current().unwrap();
         let pid_list = node.get_pid_list().unwrap();
         assert!(pid_list.contains(&Pid::this()));
@@ -682,7 +700,7 @@ mod tests {
         format!("{}_{}", s, rand::random::<u64>())
     }
 
-    fn create_test_node_on_root_node(ctl: &CgroupController) -> CgroupNode {
+    fn create_test_node_on_root_node<F>(ctl: &CgroupController<F>) -> CgroupNode<F> where F: Func {
         // randomly generate a test node
         let test_node_name = random_name("test_node");
         let root = ctl.get_root_node().unwrap();
@@ -692,7 +710,7 @@ mod tests {
         test_node
     }
 
-    fn cleanup_node(ctl: &CgroupController, node: CgroupNode) {
+    fn cleanup_node<F>(ctl: &CgroupController<F>, node: CgroupNode<F>) where F: Func {
         let root = ctl.get_root_node().unwrap();
         node.cleanup(&root).unwrap();
         node.destroy().unwrap();
